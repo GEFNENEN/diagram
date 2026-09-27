@@ -450,7 +450,9 @@ fn is_valid_id(s: &str) -> bool {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
         return true;
     }
-    s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    // Accept the same character set the Mermaid exporter emits (see
+    // `diagram::mermaid_id`): alphanumerics plus ``_`` ``-`` ``.`` ``:``.
+    s.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
 }
 
 fn unquote_id(s: &str) -> String {
@@ -595,13 +597,33 @@ mod tests {
 
     #[test]
     fn test_quoted_ids_roundtrip() {
+        // Parser stays lenient (reads the legacy quoted form), but the exporter
+        // must emit Mermaid-legal ids: a quoted id is a syntax error in Mermaid,
+        // so spaces are normalized to underscores on output.
         let source = r#"graph TD
     "my node"[Start] --> "other node"[End]"#;
         let diagram = parse(source).unwrap();
         let output = diagram.to_mermaid();
+        assert!(!output.contains('"'), "export must not quote ids:\n{output}");
         let parsed = parse(&output).unwrap();
-        assert_eq!(parsed.nodes[0].id, "my node");
-        assert_eq!(parsed.nodes[1].id, "other node");
+        assert_eq!(parsed.nodes[0].id, "my_node");
+        assert_eq!(parsed.nodes[1].id, "other_node");
+        // Display labels are preserved.
+        assert_eq!(parsed.nodes[0].text, "Start");
+        assert_eq!(parsed.nodes[1].text, "End");
+    }
+
+    #[test]
+    fn test_rust_path_ids_are_mermaid_legal() {
+        // Ids containing `::` (Rust paths) are legal unquoted in Mermaid and must
+        // not be wrapped in quotes, which the parser/grammar rejects.
+        let source = "graph TD\n    use::InputBuffer((crate::input_buffer::InputBuffer))\n    __root__ -.->|use| use::InputBuffer";
+        let diagram = parse(source).unwrap();
+        let output = diagram.to_mermaid();
+        assert!(!output.contains('"'), "export must not quote ids:\n{output}");
+        assert!(output.contains("use::InputBuffer(("), "id should stay bare:\n{output}");
+        let parsed = parse(&output).unwrap();
+        assert_eq!(parsed.nodes.len(), 2);
     }
 
     #[test]

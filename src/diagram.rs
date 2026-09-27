@@ -137,6 +137,46 @@ pub fn format_id(id: &str) -> String {
     }
 }
 
+/// Normalize an id for a Mermaid node/edge position.
+///
+/// Mermaid node ids are bare tokens; a quoted id such as `"use::InputBuffer"`
+/// is a parse error, so non-safe characters are replaced with `_` instead of
+/// being quoted. `:`/`.`/`-` are kept because they are legal in ids (and keep
+/// Rust paths like `fn::name` readable). A leading digit gets an `n_` prefix.
+pub fn mermaid_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for c in id.chars() {
+        if c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    if out.as_bytes()[0].is_ascii_digit() {
+        out.insert_str(0, "n_");
+    }
+    out
+}
+
+/// Escape a node label for a Mermaid `[..]` / `(..)` / `{..}` text slot.
+///
+/// Quotes, pipes and newlines cannot appear literally, so the label is wrapped
+/// in quotes with those characters entity-escaped. Everything else (including
+/// `<`, `>` and `&`, common in Rust generics) is emitted verbatim.
+pub fn mermaid_label(text: &str) -> String {
+    if text.contains(['"', '|', '\n']) {
+        format!(
+            "\"{}\"",
+            text.replace('"', "#quot;").replace('\n', "<br/>")
+        )
+    } else {
+        text.to_string()
+    }
+}
+
 impl Diagram {
     pub fn new(rankdir: &str) -> Self {
         Self {
@@ -327,8 +367,9 @@ impl Diagram {
     pub fn to_mermaid(&self) -> String {
         let mut out = format!("graph {}\n", self.rankdir);
         for n in &self.nodes {
-            let id = format_id(&n.id);
-            let t = &n.text;
+            let id = mermaid_id(&n.id);
+            let t = mermaid_label(&n.text);
+            let t = &t;
             match n.shape {
                 NodeShape::Rect => out.push_str(&format!("    {}[{}]\n", id, t)),
                 NodeShape::Diamond => out.push_str(&format!("    {}{{{}}}\n", id, t)),
@@ -340,8 +381,8 @@ impl Diagram {
         }
         for e in &self.edges {
             let arrow = e.style.arrow_str();
-            let from = format_id(&e.from);
-            let to = format_id(&e.to);
+            let from = mermaid_id(&e.from);
+            let to = mermaid_id(&e.to);
             if e.label.is_empty() {
                 out.push_str(&format!("    {} {} {}\n", from, arrow, to));
             } else {
@@ -349,20 +390,20 @@ impl Diagram {
             }
         }
         for sg in &self.subgraphs {
-            out.push_str(&format!("    subgraph {}\n", format_id(&sg.id)));
+            out.push_str(&format!("    subgraph {}\n", mermaid_id(&sg.id)));
             for nid in &sg.nodes {
-                out.push_str(&format!("        {}\n", format_id(nid)));
+                out.push_str(&format!("        {}\n", mermaid_id(nid)));
             }
             out.push_str("    end\n");
         }
         for s in &self.styles {
-            out.push_str(&format!("    style {} {}\n", format_id(&s.node_id), s.properties));
+            out.push_str(&format!("    style {} {}\n", mermaid_id(&s.node_id), s.properties));
         }
         for cd in &self.class_defs {
             out.push_str(&format!("    classDef {} {}\n", cd.name, cd.properties));
         }
         for ca in &self.class_applies {
-            let ids: Vec<String> = ca.node_ids.iter().map(|id| format_id(id)).collect();
+            let ids: Vec<String> = ca.node_ids.iter().map(|id| mermaid_id(id)).collect();
             out.push_str(&format!("    class {} {}\n", ids.join(","), ca.class_name));
         }
         for ls in &self.link_styles {
@@ -498,4 +539,74 @@ pub struct DiagramDiff {
     pub removed_edges: Vec<Edge>,
     pub modified_edges: Vec<(Edge, Edge)>,
     pub rankdir_changed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mermaid_id_keeps_legal_chars_bare() {
+        // Rust paths must stay recognizable and unquoted.
+        assert_eq!(mermaid_id("use::InputBuffer"), "use::InputBuffer");
+        assert_eq!(mermaid_id("fn::restore"), "fn::restore");
+        assert_eq!(mermaid_id("__root__"), "__root__");
+        assert_eq!(mermaid_id("a.b-c"), "a.b-c");
+    }
+
+    #[test]
+    fn mermaid_id_never_quotes_and_sanitizes_illegal_chars() {
+        assert_eq!(mermaid_id("my node"), "my_node");
+        assert_eq!(mermaid_id("A B (x)"), "A_B__x_");
+        assert_eq!(mermaid_id("sys@host"), "sys_host");
+        // Never emits a quote character.
+        assert!(!mermaid_id("weird \"id\"").contains('"'));
+    }
+
+    #[test]
+    fn mermaid_id_prefixes_leading_digit_and_never_empty() {
+        assert_eq!(mermaid_id("1thing"), "n_1thing");
+        assert_eq!(mermaid_id(""), "_");
+    }
+
+    #[test]
+    fn mermaid_label_only_quotes_when_needed() {
+        assert_eq!(mermaid_label("plain"), "plain");
+        // `<`, `>` and `&` are legal verbatim.
+        assert_eq!(mermaid_label("Iterator<Item = &T>"), "Iterator<Item = &T>");
+        // Pipes, quotes and newlines force quoting with escaping.
+        assert_eq!(mermaid_label("a | b"), "\"a | b\"");
+        assert_eq!(mermaid_label("say \"hi\""), "\"say #quot;hi#quot;\"");
+        assert_eq!(mermaid_label("l1\nl2"), "\"l1<br/>l2\"");
+    }
+
+    #[test]
+    fn to_mermaid_emits_no_quoted_ids() {
+        let mut d = Diagram::new("TD");
+        d.add_node(Node {
+            id: "use::InputBuffer".into(),
+            text: "crate::input_buffer::InputBuffer".into(),
+            shape: NodeShape::Circle,
+            href: None,
+            tooltip: None,
+        })
+        .unwrap();
+        d.add_node(Node {
+            id: "__root__".into(),
+            text: "file".into(),
+            shape: NodeShape::Stadium,
+            href: None,
+            tooltip: None,
+        })
+        .unwrap();
+        d.edges.push(Edge {
+            from: "__root__".into(),
+            to: "use::InputBuffer".into(),
+            label: "use".into(),
+            style: EdgeStyle::Dashed,
+        });
+        let out = d.to_mermaid();
+        assert!(!out.contains('"'), "output must not quote ids:\n{out}");
+        assert!(out.contains("use::InputBuffer((crate::input_buffer::InputBuffer))"), "{out}");
+    }
 }
